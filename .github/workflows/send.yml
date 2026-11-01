@@ -25,6 +25,8 @@ jobs:
       more: ${{ steps.run.outputs.more }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: main  # the newest plan and send log, not the commit that queued this run
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

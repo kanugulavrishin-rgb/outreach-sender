@@ -91,9 +91,8 @@ def read_bounces(svc, state: dict) -> None:
     """Count new bounce notices by the failed address's domain."""
     seen = set(state.setdefault("seen", []))
     r = svc.users().messages().list(userId="me", q="from:mailer-daemon newer_than:14d", maxResults=200).execute()
-    for m in r.get("messages", []):
-        if m["id"] in seen:
-            continue
+    new = [m for m in r.get("messages", []) if m["id"] not in seen][:40]  # the rest are read on later passes
+    for m in new:
         msg = svc.users().messages().get(userId="me", id=m["id"], format="metadata",
                                          metadataHeaders=["X-Failed-Recipients"]).execute()
         heads = msg.get("payload", {}).get("headers", [])
@@ -147,7 +146,10 @@ def one_pass(plan: dict, state: dict) -> tuple[int, float | None]:
     sent_now, failures, tried, trouble = 0, 0, 0, 0
     if due and now.timestamp() >= state.get("paused_until", 0):
         svc = gmail()
-        read_bounces(svc, state)
+        try:
+            read_bounces(svc, state)
+        except Exception as e:  # a busy Gmail must never stop sending; the Mac's bounce counts still apply
+            print(f"Bounce check skipped this pass ({type(e).__name__})", flush=True)
         for it in due:
             dom = it.get("dom", "")
             if sent_24h >= cap or sent_now >= MAX_RUN:
@@ -175,6 +177,13 @@ def one_pass(plan: dict, state: dict) -> tuple[int, float | None]:
                     print(f"sent #{it['id']} at {datetime.now(timezone.utc):%H:%M:%S}Z ({sent_now} this pass)", flush=True)
                 trouble = 0
             except HttpError as e:
+                if e.resp.status in (403, 429) and "Quota exceeded" in str(e):  # a per-minute API limit: wait it out
+                    trouble += 1
+                    print(f"#{it['id']} hit the per-minute API limit; waiting 60 seconds", flush=True)
+                    if trouble >= 3:
+                        break
+                    time.sleep(60)
+                    continue
                 if e.resp.status == 404:
                     rec.update(status="cancelled", why="draft no longer in Gmail")
                 elif (e.resp.status in (403, 429) and "imit" in str(e)) or (e.resp.status == 400 and "recondition" in str(e)):
