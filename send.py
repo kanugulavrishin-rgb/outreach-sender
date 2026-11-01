@@ -36,6 +36,7 @@ OPEN, CLOSE = (9, 30), (17, 0)  # the recipient's local sending hours
 GAP = 3.0  # seconds between sends: bursts with no gap made Gmail refuse after about 30
 MAX_RUN = 90  # sends per run; the 15-minute clock starts the next one
 GUARD_BOUNCES, GUARD_RATE = 3, 0.30  # this many bounces at this rate stops a company
+LOOKAHEAD = 18 * 60  # a run stays this long for an upcoming send: the clock restarts about every 16 minutes
 RAMP_TOTAL, RAMP_BURST, RAMP_WAIT = 15, 5, timedelta(minutes=30)  # a company's first emails go out in small groups
 
 
@@ -126,29 +127,22 @@ def set_output(more: bool) -> None:
             f.write(f"more={'true' if more else 'false'}\n")
 
 
-def main() -> int:
+def one_pass(plan: dict, state: dict) -> tuple[int, float | None]:
+    """Send everything due now. Returns (exit code, seconds until the next scheduled send, or None)."""
     from googleapiclient.errors import HttpError
-    plan = read_enc(PLAN, {"items": []})
-    state = read_enc(STATE, {"results": {}})
-    state.setdefault("results", {})
     results = state["results"]
     now = datetime.now(timezone.utc)
     pending = [it for it in plan.get("items", []) if str(it["id"]) not in results]
-    if os.environ.get("CHECK_TOKEN") == "true":
-        print(f"Gmail sign-in OK: {gmail().users().getProfile(userId='me').execute().get('messagesTotal', '?')} messages")
-    if plan.get("stopped"):
-        print("Sending is stopped by the kill switch; nothing sent.")
-        set_output(False)
-        return 0
     cap = int(plan.get("daily_cap", 400))
     synced = set(map(str, plan.get("synced_ids", [])))
     unsynced = [r for k, r in results.items() if r.get("status") == "sent" and k not in synced]
     stamps = list(plan.get("sent_recent", [])) + [r["sent_at"] for r in unsynced]
     sent_24h = sum(1 for s in stamps if now - datetime.fromisoformat(s) < timedelta(hours=24))
     fresh = Counter(r.get("dom", "") for r in unsynced)
-    due = sorted([it for it in pending if datetime.fromisoformat(it["send_at"]) <= now and in_hours(it["tz"], now)],
+    open_now = lambda it, at: it.get("test") or in_hours(it["tz"], at)
+    due = sorted([it for it in pending if datetime.fromisoformat(it["send_at"]) <= now and open_now(it, now)],
                  key=lambda it: it["send_at"])
-    print(f"{len(pending)} pending, {len(due)} due now; {sent_24h} sent in 24h (cap {cap})")
+    print(f"{now:%H:%M:%S}Z {len(pending)} pending, {len(due)} due now; {sent_24h} sent in 24h (cap {cap})", flush=True)
     state["guarded"] = {}
     sent_now, failures, tried, trouble = 0, 0, 0, 0
     if due and now.timestamp() >= state.get("paused_until", 0):
@@ -159,10 +153,10 @@ def main() -> int:
             if sent_24h >= cap or sent_now >= MAX_RUN:
                 print("Cap for now reached; the rest wait for the next run")
                 break
-            if guard_stop(dom, plan, state, fresh):
+            if not it.get("test") and guard_stop(dom, plan, state, fresh):
                 state["guarded"][dom] = state["guarded"].get(dom, 0) + 1
                 continue
-            if ramp_wait(dom, plan, state, fresh, datetime.now(timezone.utc)):
+            if not it.get("test") and ramp_wait(dom, plan, state, fresh, datetime.now(timezone.utc)):
                 continue
             tried += 1
             rec = {"at": datetime.now(timezone.utc).isoformat(), "dom": dom}
@@ -178,7 +172,7 @@ def main() -> int:
                     sent_now += 1
                     sent_24h += 1
                     fresh[dom] += 1
-                    print(f"sent #{it['id']} ({sent_now} this run)", flush=True)
+                    print(f"sent #{it['id']} at {datetime.now(timezone.utc):%H:%M:%S}Z ({sent_now} this pass)", flush=True)
                 trouble = 0
             except HttpError as e:
                 if e.resp.status == 404:
@@ -204,10 +198,34 @@ def main() -> int:
     write_enc(STATE, state)
     if state["guarded"]:
         print(f"Bounce guard is holding {sum(state['guarded'].values())} email(s)")
-    open_items = [it for it in plan.get("items", []) if str(it["id"]) not in results
+    later = datetime.now(timezone.utc)
+    upcoming = [datetime.fromisoformat(it["send_at"]) for it in plan.get("items", []) if str(it["id"]) not in results
+                and datetime.fromisoformat(it["send_at"]) > later and open_now(it, datetime.fromisoformat(it["send_at"]))]
+    wait = (min(upcoming) - later).total_seconds() if upcoming else None
+    return (1 if tried and failures == tried else 0), wait
+
+
+def main() -> int:
+    plan = read_enc(PLAN, {"items": []})
+    state = read_enc(STATE, {"results": {}})
+    state.setdefault("results", {})
+    if os.environ.get("CHECK_TOKEN") == "true":
+        print(f"Gmail sign-in OK: {gmail().users().getProfile(userId='me').execute().get('messagesTotal', '?')} messages")
+    if plan.get("stopped"):
+        print("Sending is stopped by the kill switch; nothing sent.")
+        set_output(False)
+        return 0
+    started, code = time.time(), 0
+    while True:  # a send time coming up before the next clock tick: stay and send it on the minute
+        code, wait = one_pass(plan, state)
+        if wait is None or wait > LOOKAHEAD or time.time() + wait - started > LOOKAHEAD + 120:
+            break
+        print(f"next send in {wait:.0f}s; waiting for it", flush=True)
+        time.sleep(wait + 1)
+    open_items = [it for it in plan.get("items", []) if str(it["id"]) not in state["results"]
                   and it.get("dom", "") not in state["guarded"]]
     set_output(bool(open_items))  # the 15-minute clock keeps running while anything is left to send
-    return 1 if tried and failures == tried else 0  # a red run (and GitHub's email) when nothing could be sent
+    return code  # a red run (and GitHub's email) when nothing could be sent
 
 
 if __name__ == "__main__":

@@ -17,7 +17,7 @@ permissions:
 jobs:
   send:
     runs-on: ubuntu-latest
-    timeout-minutes: 14
+    timeout-minutes: 30
     concurrency:
       group: send
       cancel-in-progress: false
