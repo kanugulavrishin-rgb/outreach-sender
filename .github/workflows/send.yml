@@ -1,0 +1,60 @@
+name: send-due
+# Runs with the computer off. Three independent starts, so one failing never stops sending:
+#   push:     a batch was imported (plan.enc changed), starts at once.
+#   clock:    while anything is left to send, the `timer` environment waits 15 minutes with no runner, then starts the
+#             next run. This does not depend on GitHub's cron.
+#   schedule: a backup that restarts the clock if a run was ever lost. GitHub treats cron as best-effort.
+on:
+  push:
+    branches: [main]
+    paths: [plan.enc]
+  schedule:
+    - cron: "7,37 * * * *"
+  workflow_dispatch: {}
+permissions:
+  contents: write
+  actions: write
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 14
+    concurrency:
+      group: send
+      cancel-in-progress: false
+    outputs:
+      more: ${{ steps.run.outputs.more }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -q -r requirements.txt
+      - id: run
+        run: python send.py
+        env:
+          GMAIL_TOKEN: ${{ secrets.GMAIL_TOKEN }}
+          PLAN_KEY: ${{ secrets.PLAN_KEY }}
+          CHECK_TOKEN: ${{ github.event_name == 'workflow_dispatch' }}
+      - name: Save results
+        if: always()
+        run: |
+          git config user.name "outreach-sender"
+          git config user.email "outreach-sender@users.noreply.github.com"
+          git add state.enc 2>/dev/null || true
+          git diff --cached --quiet && exit 0
+          git commit -qm "state"
+          for i in 1 2 3 4; do git pull -q --rebase && git push -q && exit 0; sleep 5; done
+          exit 1
+  clock:
+    needs: send
+    if: needs.send.outputs.more == 'true'
+    runs-on: ubuntu-latest
+    environment: timer
+    steps:
+      - name: Start the next run unless another clock is already waiting
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          waiting=$(gh run list -R "$GITHUB_REPOSITORY" --workflow send-due --status waiting --json databaseId -q length)
+          [ "$waiting" = "0" ] && gh workflow run send-due -R "$GITHUB_REPOSITORY" --ref main || echo "another clock is running"
