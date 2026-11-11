@@ -37,6 +37,12 @@ GAP = 3.0  # seconds between sends: bursts with no gap made Gmail refuse after a
 MAX_RUN = 90  # sends per run; the 15-minute clock starts the next one
 GUARD_BOUNCES, GUARD_RATE = 3, 0.30  # this many bounces at this rate stops a company
 LOOKAHEAD = 18 * 60  # a run stays this long for an upcoming send: the clock restarts about every 16 minutes
+# Proof gate (2026-11-11): a company is proven by real outcomes before it gets volume. Backtest on 3,853 sends: delivery was
+# ~100% at domains whose first emails delivered and ~40% elsewhere, so the first PROOF_N emails go out alone, bounces are
+# read after MATURE minutes, and the rest are released only while the company's last WINDOW matured emails delivered at
+# MIN_RATE or better. A held company gets one probe per PROBE_EVERY so a corrected address format can earn its way back.
+PROOF_N, PROOF_NEED, WINDOW, MIN_RATE = 6, 5, 10, 0.88
+MATURE, PROBE_EVERY = timedelta(minutes=20), timedelta(hours=6)
 RAMP_TOTAL, RAMP_BURST, RAMP_WAIT = 15, 5, timedelta(minutes=30)  # a company's first emails go out in small groups
 
 
@@ -104,12 +110,33 @@ def read_bounces(svc, state: dict) -> None:
 
 
 def guard_stop(dom: str, plan: dict, state: dict, fresh: Counter) -> bool:
-    if plan.get("guard_off"):
+    if plan.get("guard_off") or "dom_window" in plan:  # the proof gate (rolling window) replaces the all-time count
         return False
     sent0, bounced0 = plan.get("dom_stats", {}).get(dom, [0, 0])
     bounced = max(bounced0, state.get("bounces", {}).get(dom, 0))
     sent = max(sent0 + fresh[dom], bounced, 1)
     return bounced >= GUARD_BOUNCES and bounced / sent >= GUARD_RATE
+
+
+def proof_hold(dom: str, plan: dict, state: dict, now: datetime) -> str:
+    """"" when this company may send now, else why not ("proving" / "low delivery")."""
+    if plan.get("guard_off") or not dom or "dom_window" not in plan:  # plans from before the gate carry no window
+        return ""
+    hist = [(datetime.fromisoformat(t), bool(ok)) for t, ok in plan.get("dom_window", {}).get(dom, [])]
+    synced = set(map(str, plan.get("synced_ids", [])))
+    mine = [r for k, r in state["results"].items() if r.get("dom") == dom and r.get("status") == "sent" and k not in synced]
+    hist += [(datetime.fromisoformat(r["sent_at"]), True) for r in mine]
+    hist.sort(key=lambda x: x[0])
+    mature = [ok for t, ok in hist if now - t >= MATURE]
+    extra = max(0, state.get("bounces", {}).get(dom, 0) - plan.get("dom_stats", {}).get(dom, [0, 0])[1])
+    mature = (mature + [False] * extra)[-WINDOW:] if extra else mature[-WINDOW:]  # bounces just read are newest
+    sent_total = len(hist)
+    if len(mature) < PROOF_N:  # still proving: only the canaries go, then everyone waits for their bounces
+        return "" if sent_total < PROOF_N else ("proving" if sum(mature) >= PROOF_NEED or len(mature) < PROOF_N else "low delivery")
+    if sum(mature) / len(mature) >= MIN_RATE:
+        return ""
+    last = hist[-1][0] if hist else None
+    return "" if last is None or now - last >= PROBE_EVERY else "low delivery"
 
 
 def ramp_wait(dom: str, plan: dict, state: dict, fresh: Counter, now: datetime) -> bool:
@@ -156,6 +183,10 @@ def one_pass(plan: dict, state: dict) -> tuple[int, float | None]:
                 print("Cap for now reached; the rest wait for the next run")
                 break
             if not it.get("test") and guard_stop(dom, plan, state, fresh):
+                state["guarded"][dom] = state["guarded"].get(dom, 0) + 1
+                continue
+            why = "" if it.get("test") else proof_hold(dom, plan, state, datetime.now(timezone.utc))
+            if why:
                 state["guarded"][dom] = state["guarded"].get(dom, 0) + 1
                 continue
             if not it.get("test") and ramp_wait(dom, plan, state, fresh, datetime.now(timezone.utc)):
